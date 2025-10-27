@@ -1,10 +1,10 @@
 name: grpc
-version: 0.1.6
+version: 0.5.0
 
 authors:
   - Jamie Gaskins <jgaskins@gmail.com>
 
-crystal: 0.36.0
+crystal: 1.15.0
 
 scripts:
   postinstall: shards build
@@ -20,5 +20,8 @@ dependencies:
   protobuf:
     github: jeromegn/protobuf.cr
     branch: master
+  http2:
+    github: ysbaddaden/http2
+    commit: 969b60761458dd3cdd4d87c3823e8f50d0afc261
 
 license: MIT

@@ -1,4 +1,6 @@
-require "./http2"
+require "./status_codes"
+require "./errors"
+require "http2/server"
 
 module GRPC
   module Service
@@ -36,30 +38,47 @@ module GRPC
             request_payload = request.to_protobuf.to_slice
 
             io.write_bytes(0_u8) # Not compressed
-            io.write_bytes(request_payload.size, IO::ByteFormat::NetworkEndian)
+            io.write_bytes(request_payload.size, IO::ByteFormat::BigEndian)
             io.write request_payload
 
-            response = @client.send(
-              headers: HTTP::Headers {
-                ":method" => "POST",
-                ":path" => "/#{T.service_name}/\{{name}}",
-                "content-type" => "application/grpc",
-              },
-              body: io.to_slice,
-            )
+            headers = HTTP::Headers {
+              ":method" => "POST",
+              ":path" => "/#{T.service_name}/\{{name}}",
+              "content-type" => "application/grpc",
+            }
 
-            compressed = response.read_byte != 0 # TODO: Handle compression?
-            length = response.read_bytes Int32, IO::ByteFormat::NetworkEndian
+            response = http2.send(headers, io.to_slice) do |response_headers, response|
+              if raw_status = response_headers["grpc-status"]?.try(&.to_i?)
+                status_code = GRPC::StatusCode.from_value?(raw_status) || GRPC::StatusCode::UNKNOWN
+                if status_code.ok?
+                  compressed = response.read_byte != 0 # TODO: Handle compression?
+                  length = response.read_bytes Int32, IO::ByteFormat::BigEndian
 
-            \{{response_type}}.from_protobuf(response)
+                  return \{{response_type}}.from_protobuf(response)
+                else
+                  raise GRPC::BadStatus.new(
+                    status_code,
+                    response_headers["grpc-message"]? || "Unknown error!"
+                  )
+                end
+
+              else
+                raise "Unable to get status code from response"
+              end
+            end
+
+            raise "Unexpected response: #{response}"
           end
         end
       end
     end
 
     class Stub(T)
-      def initialize(host : String, port : Int32)
-        @client = HTTP2::Client.new(host, port)
+      def initialize(@config : Config? = nil)
+      end
+
+      def http2
+        @config.try(&.http2) || Config.defaults.http2 || raise "No HTTP/2 client configured"
       end
     end
   end
