@@ -1,12 +1,21 @@
 module HTTP2
   class Client
+    DEFAULT_DNS_TIMEOUT = 5.0
+    DEFAULT_CONNECT_TIMEOUT = 5.0
+
     getter connection : Connection
     @requests = {} of Stream => Channel(Nil)
 
-    def initialize(host : String, port : Int32, ssl_context : Bool | OpenSSL::SSL::Context::Client = false)
+    def initialize(
+      host : String,
+      port : Int32,
+      ssl_context : Bool | OpenSSL::SSL::Context::Client = false,
+      dns_timeout = DEFAULT_DNS_TIMEOUT,
+      connect_timeout = DEFAULT_CONNECT_TIMEOUT
+    )
       @authority = "#{host}:#{port}"
 
-      io = TCPSocket.new(host, port)
+      io = TCPSocket.new(host, port, dns_timeout, connect_timeout)
 
       case ssl_context
       when true
