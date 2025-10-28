@@ -3,7 +3,7 @@ module HTTP2
     getter connection : Connection
     @requests = {} of Stream => Channel(Nil)
 
-    def initialize(host : String, port : Int32, ssl_context)
+    def initialize(host : String, port : Int32, ssl_context : Bool | OpenSSL::SSL::Context::Client = false)
       @authority = "#{host}:#{port}"
 
       io = TCPSocket.new(host, port)
@@ -66,9 +66,11 @@ module HTTP2
         stream.send_data(data, flags: Frame::Flags::END_STREAM)
       end
 
-      @requests[stream].receive
+      while stream.active?
+        @requests[stream].receive
+      end
 
-      yield stream.headers, stream.data
+      yield stream.headers, stream.trailers? || HTTP::Headers.new, stream.data
 
       if stream.active?
         stream.send_rst_stream(Error::Code::NO_ERROR)

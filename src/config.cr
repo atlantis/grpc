@@ -20,6 +20,9 @@ module GRPC
       end
     end
 
+    def initialize(@http2 : HTTP2::Client)
+    end
+
     def self.defaults(&)
       yield DEFAULTS
     end

@@ -47,18 +47,18 @@ module GRPC
               "content-type" => "application/grpc",
             }
 
-            response = http2.send(headers, io.to_slice) do |response_headers, response|
-              if raw_status = response_headers["grpc-status"]?.try(&.to_i?)
+            http2.send(headers, io.to_slice) do |response_headers, response_trailers, response_data|
+              if raw_status = (response_headers["grpc-status"]? || response_trailers["grpc-status"]?).try(&.to_i?)
                 status_code = GRPC::StatusCode.from_value?(raw_status) || GRPC::StatusCode::UNKNOWN
                 if status_code.ok?
-                  compressed = response.read_byte != 0 # TODO: Handle compression?
-                  length = response.read_bytes Int32, IO::ByteFormat::BigEndian
+                  compressed = response_data.read_byte != 0 # TODO: Handle compression?
+                  length = response_data.read_bytes Int32, IO::ByteFormat::BigEndian
 
-                  return \{{response_type}}.from_protobuf(response)
+                  return \{{response_type}}.from_protobuf(response_data)
                 else
                   raise GRPC::BadStatus.new(
                     status_code,
-                    response_headers["grpc-message"]? || "Unknown error!"
+                    response_headers["grpc-message"]? || response_trailers["grpc-message"]? || "Unknown error!"
                   )
                 end
 
@@ -67,7 +67,7 @@ module GRPC
               end
             end
 
-            raise "Unexpected response: #{response}"
+            raise "Unexpected response"
           end
         end
       end
@@ -75,6 +75,12 @@ module GRPC
 
     class Stub(T)
       def initialize(@config : Config? = nil)
+      end
+
+
+      @[Deprecated("Move to new config pattern")]
+      def initialize(host : String, port : Int32)
+        @config = Config.new(HTTP2::Client.new(host, port))
       end
 
       def http2
