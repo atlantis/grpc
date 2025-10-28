@@ -80,7 +80,7 @@ module GRPC
 
       @[Deprecated("Move to new config pattern")]
       def initialize(host : String, port : Int32)
-        @config = Config.new(HTTP2::Client.new(host, port))
+        @config = Config.new(GRPC::Client.new(host, port))
       end
 
       def http2

@@ -5,7 +5,7 @@ module GRPC
   class Config
     DEFAULTS = Config.new
 
-    property http2 : HTTP2::Client? = nil
+    property http2 : GRPC::Client? = nil
 
     def initialize
       if (host = ENV.fetch("GRPC_HOST", nil)) && (port = ENV.fetch("GRPC_PORT", nil).try(&.to_i?))
@@ -16,11 +16,11 @@ module GRPC
                 false
               end
 
-        @http2 = HTTP2::Client.new(host, port, tls)
+        @http2 = GRPC::Client.new(host, port, tls)
       end
     end
 
-    def initialize(@http2 : HTTP2::Client)
+    def initialize(@http2 : GRPC::Client)
     end
 
     def self.defaults(&)

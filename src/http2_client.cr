@@ -1,17 +1,24 @@
-module HTTP2
+module GRPC
   class Client
+    alias Connection = HTTP2::Connection
+    alias Stream = HTTP2::Stream
+    alias Frame = HTTP2::Frame
+    alias Error = HTTP2::Error
+
     DEFAULT_DNS_TIMEOUT = 5.0
     DEFAULT_CONNECT_TIMEOUT = 5.0
 
     getter connection : Connection
+    property default_headers : HTTP::Headers
     @requests = {} of Stream => Channel(Nil)
 
     def initialize(
       host : String,
       port : Int32,
-      ssl_context : Bool | OpenSSL::SSL::Context::Client = false,
+      ssl_context : HTTP::Client::TLSContext = nil,
       dns_timeout = DEFAULT_DNS_TIMEOUT,
-      connect_timeout = DEFAULT_CONNECT_TIMEOUT
+      connect_timeout = DEFAULT_CONNECT_TIMEOUT,
+      @default_headers = HTTP::Headers.new
     )
       @authority = "#{host}:#{port}"
 
@@ -63,11 +70,10 @@ module HTTP2
 
     # Unary request that closes the stream via flags after sending the data
     def send(headers : HTTP::Headers, data : Bytes? = nil, &)
-      headers[":authority"] = @authority
-      headers[":scheme"] ||= @scheme
-
       stream = @connection.streams.create
       @requests[stream] = Channel(Nil).new
+
+      headers = sorted_headers_with_defaults(headers)
 
       stream.send_headers(headers, flags: Frame::Flags::END_HEADERS)
 
@@ -92,6 +98,41 @@ module HTTP2
 
     def closed?
       @connection.closed?
+    end
+
+    # HTTP2 requires pseudo headers (starting with colon) to be first
+    protected def sorted_headers_with_defaults(headers : HTTP::Headers)
+      # if you must, you can override these using default_headers
+      sorted_headers = HTTP::Headers{
+        ":authority" => @authority,
+        ":scheme" => @scheme,
+      }
+
+      default_headers.each do |name, value|
+        if name.starts_with?(":")
+          sorted_headers[name] = value
+        end
+      end
+
+      headers.each do |name, value|
+        if name.starts_with?(":")
+          sorted_headers[name] = value
+        end
+      end
+
+      default_headers.each do |name, value|
+        unless name.starts_with?(":")
+          sorted_headers[name] = value
+        end
+      end
+
+      headers.each do |name, value|
+        unless name.starts_with?(":")
+          sorted_headers[name] = value
+        end
+      end
+
+      sorted_headers
     end
   end
 end
