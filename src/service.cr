@@ -74,7 +74,7 @@ module GRPC
     end
 
     class Stub(T)
-      def initialize(@config : Config? = nil)
+      def initialize(@config : GRPC::Config? = nil)
       end
 
 
