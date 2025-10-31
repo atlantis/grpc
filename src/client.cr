@@ -5,7 +5,7 @@ module GRPC
     alias Frame = HTTP2::Frame
     alias Error = HTTP2::Error
 
-    DEFAULT_DNS_TIMEOUT = 5.0
+    DEFAULT_DNS_TIMEOUT     = 5.0
     DEFAULT_CONNECT_TIMEOUT = 5.0
 
     getter connection : Connection
@@ -18,7 +18,7 @@ module GRPC
       ssl_context : HTTP::Client::TLSContext = nil,
       dns_timeout = DEFAULT_DNS_TIMEOUT,
       connect_timeout = DEFAULT_CONNECT_TIMEOUT,
-      @default_headers = HTTP::Headers.new
+      @default_headers = HTTP::Headers.new,
     )
       @authority = "#{host}:#{port}"
 
@@ -58,12 +58,14 @@ module GRPC
         end
 
         case frame.type
-        when Frame::Type::HEADERS
-          @requests[frame.stream].send(nil)
         when Frame::Type::PUSH_PROMISE
           # TODO: got SERVER PUSHed headers
         when Frame::Type::GOAWAY
           break
+        end
+
+        unless frame.stream.active?
+          @requests[frame.stream]?.try(&.send(nil))
         end
       end
     end
@@ -75,15 +77,16 @@ module GRPC
 
       headers = sorted_headers_with_defaults(headers)
 
-      stream.send_headers(headers, flags: Frame::Flags::END_HEADERS)
+      header_flags = Frame::Flags::END_HEADERS
+      header_flags |= Frame::Flags::END_STREAM if data.nil?
+      stream.send_headers(headers, flags: header_flags)
 
       unless data.nil?
         stream.send_data(data, flags: Frame::Flags::END_STREAM)
       end
 
-      while stream.active?
-        @requests[stream].receive
-      end
+      @requests[stream].receive
+      @requests.delete(stream) # make sure that we clean this up so handle_connection doesn't send() and hang
 
       yield stream.headers, stream.trailers? || HTTP::Headers.new, stream.data
 
@@ -105,7 +108,7 @@ module GRPC
       # if you must, you can override these using default_headers
       sorted_headers = HTTP::Headers{
         ":authority" => @authority,
-        ":scheme" => @scheme,
+        ":scheme"    => @scheme,
       }
 
       default_headers.each do |name, value|

@@ -4,7 +4,7 @@ require "socket"
 require "openssl"
 
 require "./config"
-require "./http2_client"
+require "./client"
 require "./status_codes"
 require "./errors"
 require "./service"
