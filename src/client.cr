@@ -9,8 +9,11 @@ module GRPC
     DEFAULT_CONNECT_TIMEOUT = 5.0
 
     getter connection : Connection
+    getter authority : String
+    getter scheme : String
     property default_headers : HTTP::Headers
     @requests = {} of Stream => Channel(Nil)
+    @bidirectional_streams = {} of Stream => Channel(Nil)
 
     def initialize(
       host : String,
@@ -58,15 +61,21 @@ module GRPC
         end
 
         case frame.type
+        when Frame::Type::DATA
+          # Bidirectional streams are notified for all data frames
+          if bidirectional_stream = @bidirectional_streams[frame.stream]?
+            bidirectional_stream.send(nil)            
+          end
         when Frame::Type::PUSH_PROMISE
           # TODO: got SERVER PUSHed headers
         when Frame::Type::GOAWAY
           break
         end
 
+        # Unary requests are notified when the stream is closed
         unless frame.stream.active?
           @requests[frame.stream]?.try(&.send(nil))
-        end
+        end        
       end
     end
 
@@ -95,7 +104,29 @@ module GRPC
       end
     end
 
+    # Stream request that waits for an initial response but then leaves the stream open
+    # this function will yield each time there's a new data packet on the stream
+    def stream(headers : HTTP::Headers, data : Bytes? = nil, &)
+      stream = @connection.streams.create
+      @bidirectional_streams[stream] = Channel(Nil).new
+
+      headers = sorted_headers_with_defaults(headers)
+
+      stream.send_headers(headers, flags: Frame::Flags::END_HEADERS)
+
+      stream.send_data(data) unless data.nil?
+
+      while stream.active?
+        @bidirectional_streams[stream]?.try(&.receive)
+        yield stream 
+      end
+    end
+
     def close
+      @requests.each(&.close)
+      @requests.clear
+      @bidirectional_streams.each(&.close)
+      @bidirectional_streams.clear
       @connection.close unless closed?
     end
 
