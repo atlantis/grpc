@@ -13,7 +13,7 @@ module GRPC
     getter scheme : String
     property default_headers : HTTP::Headers
     @requests = {} of Stream => Channel(Nil)
-    @bidirectional_streams = {} of Stream => Channel(Nil)
+    @bidirectional_streams = {} of Stream => Channel(Bytes)
 
     def initialize(
       host : String,
@@ -64,7 +64,9 @@ module GRPC
         when Frame::Type::DATA
           # Bidirectional streams are notified for all data frames
           if bidirectional_stream = @bidirectional_streams[frame.stream]?
-            bidirectional_stream.send(nil)            
+            bytes = Bytes.new(frame.stream.data.size)
+            frame.stream.data.read(bytes)
+            bidirectional_stream.send(bytes)    
           end
         when Frame::Type::PUSH_PROMISE
           # TODO: got SERVER PUSHed headers
@@ -106,9 +108,9 @@ module GRPC
 
     # Stream request that waits for an initial response but then leaves the stream open
     # this function will yield each time there's a new data packet on the stream
-    def stream(headers : HTTP::Headers, data : Bytes? = nil, &)
+    def open_stream(headers : HTTP::Headers, data : Bytes? = nil)
       stream = @connection.streams.create
-      @bidirectional_streams[stream] = Channel(Nil).new
+      @bidirectional_streams[stream] = Channel(Bytes).new
 
       headers = sorted_headers_with_defaults(headers)
 
@@ -116,10 +118,7 @@ module GRPC
 
       stream.send_data(data) unless data.nil?
 
-      while stream.active?
-        @bidirectional_streams[stream]?.try(&.receive)
-        yield stream 
-      end
+      @bidirectional_streams[stream]
     end
 
     def close
