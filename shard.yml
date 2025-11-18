@@ -21,7 +21,7 @@ dependencies:
     github: jeromegn/protobuf.cr
     branch: master
   http2:
-    github: ysbaddaden/http2
-    commit: 969b60761458dd3cdd4d87c3823e8f50d0afc261
+    github: atlantis/http2
+    commit: 98782868a4c60768a8cf0f7b11f11f359e4e423a
 
 license: MIT
