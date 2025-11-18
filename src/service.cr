@@ -1,6 +1,5 @@
 require "./status_codes"
 require "./errors"
-require "http2/server"
 
 module GRPC
   module Service
