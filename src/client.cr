@@ -122,9 +122,9 @@ module GRPC
     end
 
     def close
-      @requests.each(&.close)
+      @requests.each_value(&.close)
       @requests.clear
-      @bidirectional_streams.each(&.close)
+      @bidirectional_streams.each_value(&.close)
       @bidirectional_streams.clear
       @connection.close unless closed?
     end
