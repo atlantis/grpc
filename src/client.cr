@@ -66,7 +66,7 @@ module GRPC
           if bidirectional_stream = @bidirectional_streams[frame.stream]?
             bytes = Bytes.new(frame.stream.data.size)
             frame.stream.data.read(bytes)
-            bidirectional_stream.send(bytes)    
+            bidirectional_stream.send(bytes)
           end
         when Frame::Type::PUSH_PROMISE
           # TODO: got SERVER PUSHed headers
@@ -76,8 +76,11 @@ module GRPC
 
         # Unary requests are notified when the stream is closed
         unless frame.stream.active?
+          if channel = @bidirectional_streams.delete(frame.stream)
+            channel.close
+          end
           @requests[frame.stream]?.try(&.send(nil))
-        end        
+        end
       end
     end
 

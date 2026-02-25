@@ -22,6 +22,6 @@ dependencies:
     branch: master
   http2:
     github: atlantis/http2
-    commit: 98782868a4c60768a8cf0f7b11f11f359e4e423a
+    commit: 2d6e30616a8548c156c1546bd3618bcf0c10feac
 
 license: MIT
