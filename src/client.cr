@@ -82,6 +82,12 @@ module GRPC
           @requests[frame.stream]?.try(&.send(nil))
         end
       end
+    ensure
+      # Unblock any fibers still waiting on a request channel (GOAWAY or connection drop)
+      @requests.each_value(&.close)
+      @requests.clear
+      @bidirectional_streams.each_value(&.close)
+      @bidirectional_streams.clear
     end
 
     # Unary request that closes the stream via flags after sending the data
