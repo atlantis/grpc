@@ -5,15 +5,22 @@ module GRPC
     alias Frame = HTTP2::Frame
     alias Error = HTTP2::Error
 
+    Log = ::Log.for("grpc.client")
+
     DEFAULT_DNS_TIMEOUT     = 5.0
     DEFAULT_CONNECT_TIMEOUT = 5.0
+    REQUEST_TIMEOUT         = 30.seconds
 
     getter connection : Connection
     getter authority : String
     getter scheme : String
     property default_headers : HTTP::Headers
+    # How long a unary `send` waits for the stream to close before giving up
+    property request_timeout : Time::Span = REQUEST_TIMEOUT
     @requests = {} of Stream => Channel(Nil)
     @bidirectional_streams = {} of Stream => Channel(Bytes)
+    # Bytes already handed to each consumer: `Stream#data.size` is the lifetime total, not what is unread
+    @consumed = {} of Stream => Int64
 
     def initialize(
       host : String,
@@ -64,36 +71,50 @@ module GRPC
         when Frame::Type::DATA
           # Bidirectional streams are notified for all data frames
           if bidirectional_stream = @bidirectional_streams[frame.stream]?
-            bytes = Bytes.new(frame.stream.data.size)
-            frame.stream.data.read(bytes)
-            bidirectional_stream.send(bytes)
+            data = frame.stream.data
+            unread = data.size - (@consumed[frame.stream]? || 0_i64)
+            if unread > 0
+              bytes = Bytes.new(unread)
+              got = data.read(bytes)
+              @consumed[frame.stream] = (@consumed[frame.stream]? || 0_i64) + got
+              begin
+                bidirectional_stream.send(bytes[0, got]) unless bidirectional_stream.closed?
+              rescue Channel::ClosedError
+                # the consumer gave up on this stream; keep serving the others
+                @bidirectional_streams.delete(frame.stream)
+              end
+            end
           end
         when Frame::Type::PUSH_PROMISE
-          # TODO: got SERVER PUSHed headers
+          # server push is not used
         when Frame::Type::GOAWAY
           break
         end
 
         # Unary requests are notified when the stream is closed
         unless frame.stream.active?
+          @consumed.delete(frame.stream)
           if channel = @bidirectional_streams.delete(frame.stream)
             channel.close
           end
           @requests[frame.stream]?.try(&.send(nil))
         end
       end
+    rescue ex : HTTP2::Error | IO::Error
+      Log.debug { "connection loop ended: #{ex.message}" }
     ensure
       # Unblock any fibers still waiting on a request channel (GOAWAY or connection drop)
       @requests.each_value(&.close)
       @requests.clear
       @bidirectional_streams.each_value(&.close)
       @bidirectional_streams.clear
+      @consumed.clear
     end
 
     # Unary request that closes the stream via flags after sending the data
     def send(headers : HTTP::Headers, data : Bytes? = nil, &)
       stream = @connection.streams.create
-      @requests[stream] = Channel(Nil).new
+      channel = @requests[stream] = Channel(Nil).new
 
       headers = sorted_headers_with_defaults(headers)
 
@@ -105,7 +126,13 @@ module GRPC
         stream.send_data(data, flags: Frame::Flags::END_STREAM)
       end
 
-      @requests[stream].receive
+      select
+      when channel.receive
+      when timeout(request_timeout)
+        @requests.delete(stream)
+        stream.send_rst_stream(Error::Code::CANCEL) rescue nil
+        raise IO::TimeoutError.new("no answer within #{request_timeout.total_seconds.to_i}s")
+      end
       @requests.delete(stream) # make sure that we clean this up so handle_connection doesn't send() and hang
 
       yield stream.headers, stream.trailers? || HTTP::Headers.new, stream.data

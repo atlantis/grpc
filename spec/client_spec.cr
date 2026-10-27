@@ -15,7 +15,7 @@ describe GRPC::Client do
       }
 
       result = client.sorted_headers_for_test(headers)
-      keys = result.keys
+      keys = result.map { |name, _| name }
 
       # Pseudo-headers must all precede regular headers
       last_pseudo = keys.rindex { |k| k.starts_with?(":") } || -1
