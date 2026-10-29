@@ -83,3 +83,49 @@ def write_data_frame(io : IO, stream_id : Int32, payload : Bytes, end_stream = f
   io.write(payload)
   io.flush
 end
+
+# Writes a HEADERS frame for *stream_id* as a server would put it on the wire (END_HEADERS set)
+def write_headers_frame(io : IO, stream_id : Int32, headers : HTTP::Headers, end_stream = false)
+  payload = HTTP2::HPACK::Encoder.new.encode(headers)
+  flags = HTTP2::Frame::Flags::END_HEADERS
+  flags |= HTTP2::Frame::Flags::END_STREAM if end_stream
+  io.write_bytes((payload.size.to_u32 << 8) | HTTP2::Frame::Type::HEADERS.value.to_u32, IO::ByteFormat::BigEndian)
+  io.write_byte(flags.value)
+  io.write_bytes(stream_id.to_u32, IO::ByteFormat::BigEndian)
+  io.write(payload)
+  io.flush
+end
+
+# A frame as the spec's fake server reads it off the wire
+record WireFrame, type : HTTP2::Frame::Type, flags : HTTP2::Frame::Flags, stream_id : Int32, payload : Bytes do
+  def end_stream?
+    flags.end_stream?
+  end
+
+  # Increment carried by a WINDOW_UPDATE frame
+  def window_increment
+    IO::ByteFormat::BigEndian.decode(UInt32, payload).to_i32 & 0x7fffffff
+  end
+end
+
+# Reads one frame the client wrote, or nil once the client side is closed
+def read_wire_frame(io : IO) : WireFrame?
+  header = Bytes.new(9)
+  return if io.read_fully?(header).nil?
+  length = (header[0].to_i32 << 16) | (header[1].to_i32 << 8) | header[2].to_i32
+  type = HTTP2::Frame::Type.new(header[3].to_i32)
+  flags = HTTP2::Frame::Flags.new(header[4])
+  stream_id = IO::ByteFormat::BigEndian.decode(UInt32, header[5, 4]).to_i32 & 0x7fffffff
+  payload = Bytes.new(length)
+  io.read_fully(payload)
+  WireFrame.new(type, flags, stream_id, payload)
+end
+
+# Writes a RST_STREAM frame for *stream_id* as a server would put it on the wire
+def write_rst_stream_frame(io : IO, stream_id : Int32, code = HTTP2::Error::Code::INTERNAL_ERROR)
+  io.write_bytes((4_u32 << 8) | HTTP2::Frame::Type::RST_STREAM.value.to_u32, IO::ByteFormat::BigEndian)
+  io.write_byte(0_u8)
+  io.write_bytes(stream_id.to_u32, IO::ByteFormat::BigEndian)
+  io.write_bytes(code.value.to_u32, IO::ByteFormat::BigEndian)
+  io.flush
+end

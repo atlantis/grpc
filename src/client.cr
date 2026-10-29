@@ -21,6 +21,10 @@ module GRPC
     @bidirectional_streams = {} of Stream => Channel(Bytes)
     # Bytes already handed to each consumer: `Stream#data.size` is the lifetime total, not what is unread
     @consumed = {} of Stream => Int64
+    # Reply bytes of each unary stream, drained as they arrive so the stream's receive window keeps
+    # being replenished; a reply larger than the window would otherwise never finish (the server
+    # waits for WINDOW_UPDATE, we wait for END_STREAM)
+    @unary_bodies = {} of Stream => IO::Memory
 
     def initialize(
       host : String,
@@ -71,19 +75,16 @@ module GRPC
         when Frame::Type::DATA
           # Bidirectional streams are notified for all data frames
           if bidirectional_stream = @bidirectional_streams[frame.stream]?
-            data = frame.stream.data
-            unread = data.size - (@consumed[frame.stream]? || 0_i64)
-            if unread > 0
-              bytes = Bytes.new(unread)
-              got = data.read(bytes)
-              @consumed[frame.stream] = (@consumed[frame.stream]? || 0_i64) + got
+            if bytes = read_unread(frame.stream)
               begin
-                bidirectional_stream.send(bytes[0, got]) unless bidirectional_stream.closed?
+                bidirectional_stream.send(bytes) unless bidirectional_stream.closed?
               rescue Channel::ClosedError
                 # the consumer gave up on this stream; keep serving the others
                 @bidirectional_streams.delete(frame.stream)
               end
             end
+          elsif @requests.has_key?(frame.stream)
+            drain(frame.stream)
           end
         when Frame::Type::PUSH_PROMISE
           # server push is not used
@@ -93,7 +94,11 @@ module GRPC
 
         # Unary requests are notified when the stream is closed
         unless frame.stream.active?
-          @consumed.delete(frame.stream)
+          # a waiting `send` drains the stream once more and then drops its own bookkeeping
+          unless @requests.has_key?(frame.stream)
+            @consumed.delete(frame.stream)
+            @unary_bodies.delete(frame.stream)
+          end
           if channel = @bidirectional_streams.delete(frame.stream)
             channel.close
           end
@@ -109,6 +114,30 @@ module GRPC
       @bidirectional_streams.each_value(&.close)
       @bidirectional_streams.clear
       @consumed.clear
+      @unary_bodies.clear
+    end
+
+    # Reads what the connection has buffered for *stream* since the last call, or nil when nothing is new
+    private def read_unread(stream : Stream) : Bytes?
+      data = stream.data
+      consumed = @consumed[stream]? || 0_i64
+      unread = data.size - consumed
+      return if unread <= 0
+
+      bytes = Bytes.new(unread)
+      got = data.read(bytes)
+      @consumed[stream] = consumed + got
+      bytes[0, got]
+    end
+
+    # Moves a unary stream's new bytes into its reply body; reading from `Stream#data` is what
+    # sends the stream WINDOW_UPDATE
+    private def drain(stream : Stream) : IO::Memory
+      body = @unary_bodies[stream] ||= IO::Memory.new
+      if bytes = read_unread(stream)
+        body.write(bytes)
+      end
+      body
     end
 
     # Unary request that closes the stream via flags after sending the data
@@ -130,12 +159,20 @@ module GRPC
       when channel.receive
       when timeout(request_timeout)
         @requests.delete(stream)
+        @unary_bodies.delete(stream)
+        @consumed.delete(stream)
         stream.send_rst_stream(Error::Code::CANCEL) rescue nil
         raise IO::TimeoutError.new("no answer within #{request_timeout.total_seconds.to_i}s")
       end
       @requests.delete(stream) # make sure that we clean this up so handle_connection doesn't send() and hang
 
-      yield stream.headers, stream.trailers? || HTTP::Headers.new, stream.data
+      # whatever came with the frame that closed the stream, after the last DATA callback
+      body = drain(stream)
+      @unary_bodies.delete(stream)
+      @consumed.delete(stream)
+      body.rewind
+
+      yield stream.headers, stream.trailers? || HTTP::Headers.new, body
 
       if stream.active?
         stream.send_rst_stream(Error::Code::NO_ERROR)

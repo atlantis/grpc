@@ -16,6 +16,44 @@ private def stream_headers
   HTTP::Headers{":method" => "POST", ":path" => "/svc/Watch", "content-type" => "application/grpc"}
 end
 
+# Plays a flow-control-abiding server for stream 1: waits for the request, then writes *reply* in
+# DATA frames without ever exceeding the stream window, growing it only on the client's
+# WINDOW_UPDATEs. Without those the reply stalls at the initial window, as etcd does.
+private def serve_unary(server_io, reply : Bytes, trailers : HTTP::Headers? = nil)
+  window_updates = Channel(Int32).new(16)
+  spawn do
+    request_done = false
+    while frame = read_wire_frame(server_io)
+      if frame.stream_id == 1 && frame.type.data? && frame.end_stream?
+        request_done = true
+        write_reply(server_io, reply, trailers, window_updates)
+      elsif frame.stream_id == 1 && frame.type.window_update?
+        window_updates.send(frame.window_increment)
+      end
+    end
+  end
+end
+
+private def write_reply(server_io, reply : Bytes, trailers, window_updates)
+  spawn do
+    window = HTTP2::DEFAULT_INITIAL_WINDOW_SIZE
+    chunk = HTTP2::DEFAULT_MAX_FRAME_SIZE
+    offset = 0
+    while offset < reply.size
+      # fill the window exactly, as a real server does, then wait for it to grow
+      while window == 0
+        window += window_updates.receive
+      end
+      size = {chunk, reply.size - offset, window}.min
+      last = offset + size == reply.size
+      write_data_frame(server_io, 1, reply[offset, size], end_stream: last && trailers.nil?)
+      window -= size
+      offset += size
+    end
+    write_headers_frame(server_io, 1, trailers, end_stream: true) if trailers
+  end
+end
+
 describe GRPC::Client do
   describe "#handle_connection" do
     it "hands over exactly the bytes of each DATA frame" do
@@ -72,6 +110,52 @@ describe GRPC::Client do
   end
 
   describe "#send" do
+    it "receives a unary reply larger than the stream window" do
+      client, server_io, _ = piped_client
+      client.request_timeout = 2.seconds
+      reply = Bytes.new(200_000) { |i| (i % 251).to_u8 }
+      serve_unary(server_io, reply)
+
+      client.send(stream_headers, "req".to_slice) do |_headers, _trailers, body|
+        body.gets_to_end.to_slice.should eq(reply)
+      end
+
+      client.close
+    end
+
+    it "keeps the whole reply when trailers close the stream" do
+      client, server_io, _ = piped_client
+      client.request_timeout = 2.seconds
+      reply = Bytes.new(100_000) { |i| (i % 13).to_u8 }
+      serve_unary(server_io, reply, HTTP::Headers{"grpc-status" => "0"})
+
+      client.send(stream_headers, "req".to_slice) do |_headers, trailers, body|
+        trailers["grpc-status"].should eq("0")
+        body.gets_to_end.to_slice.should eq(reply)
+      end
+
+      client.close
+    end
+
+    it "yields what arrived when the server resets the stream" do
+      client, server_io, _ = piped_client
+      client.request_timeout = 2.seconds
+      spawn do
+        while frame = read_wire_frame(server_io)
+          if frame.stream_id == 1 && frame.type.data? && frame.end_stream?
+            write_data_frame(server_io, 1, "partial".to_slice)
+            write_rst_stream_frame(server_io, 1)
+          end
+        end
+      end
+
+      client.send(stream_headers, "req".to_slice) do |_headers, _trailers, body|
+        body.gets_to_end.should eq("partial")
+      end
+
+      client.close
+    end
+
     it "raises IO::TimeoutError when the server never answers" do
       client, _, _ = piped_client
       client.request_timeout = 50.milliseconds
