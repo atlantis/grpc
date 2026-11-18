@@ -37,6 +37,7 @@ module GRPC
       @authority = "#{host}:#{port}"
 
       io = TCPSocket.new(host, port, dns_timeout, connect_timeout)
+      io.tcp_nodelay = true
 
       case ssl_context
       when true
