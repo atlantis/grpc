@@ -10,6 +10,8 @@ module GRPC
     DEFAULT_DNS_TIMEOUT     = 5.0
     DEFAULT_CONNECT_TIMEOUT = 5.0
     REQUEST_TIMEOUT         = 30.seconds
+    # How long `#close` waits to send its GOAWAY before closing the socket regardless
+    CLOSE_TIMEOUT = 1.second
 
     getter connection : Connection
     getter authority : String
@@ -226,8 +228,29 @@ module GRPC
       @requests.clear
       @bidirectional_streams.each_value(&.receive.close)
       @bidirectional_streams.clear
-      @connection.close unless closed?
+      send_goaway
       close_socket
+      # the GOAWAY may still be waiting on the write mutex; mark the connection closed either way
+      @connection.close(notify: false)
+    end
+
+    # RFC 9113 §6.8 asks for a GOAWAY before closing. It waits on the write mutex, which a writer
+    # blocked on a dead peer holds until the socket closes, so the wait is bounded
+    private def send_goaway : Nil
+      return if closed?
+      sent = Channel(Nil).new(1)
+      spawn do
+        @connection.close
+      rescue OpenSSL::Error
+        # under TLS the write fails this way once `close_socket` has run beneath it
+      ensure
+        sent.send(nil)
+      end
+      select
+      when sent.receive
+      when timeout(CLOSE_TIMEOUT)
+        Log.debug { "GOAWAY not sent within #{CLOSE_TIMEOUT.total_seconds}s, closing the socket" }
+      end
     end
 
     # Closes the TCP socket, never the TLS one: `SSL::Socket#close` writes a close_notify that can

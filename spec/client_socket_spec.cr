@@ -20,6 +20,8 @@ private enum PeerMode
   Silent
   # completes the preface and settings, then closes its side
   HangUp
+  # opens every flow-control window wide, then never reads, so a writer blocks in the socket write
+  Stalled
 end
 
 # Accepts connections, completes the HTTP/2 preface, then behaves as *mode* says
@@ -46,12 +48,16 @@ private class FakeServer
     end
     io.read_fully(Bytes.new(HTTP2::CLIENT_PREFACE.bytesize))
     read_wire_frame(io) # the client's SETTINGS
-    io.write_bytes(HTTP2::Frame::Type::SETTINGS.value.to_u32, IO::ByteFormat::BigEndian)
-    io.write_byte(0_u8)
-    io.write_bytes(0_u32, IO::ByteFormat::BigEndian)
+    if @mode.stalled?
+      write_wide_windows(io)
+    else
+      io.write_bytes(HTTP2::Frame::Type::SETTINGS.value.to_u32, IO::ByteFormat::BigEndian)
+      io.write_byte(0_u8)
+      io.write_bytes(0_u32, IO::ByteFormat::BigEndian)
+    end
     io.flush
     case @mode
-    in .silent? then @peers << socket
+    in .silent?, .stalled? then @peers << socket
     in .hang_up?
       # after the client's SETTINGS ack, so the hang-up meets the running loop and not the handshake
       while frame = read_wire_frame(io)
@@ -61,6 +67,21 @@ private class FakeServer
     end
   rescue IO::Error | OpenSSL::Error
     socket.close
+  end
+
+  # SETTINGS INITIAL_WINDOW_SIZE = 2^31-1 plus a connection WINDOW_UPDATE to the same size
+  private def write_wide_windows(io : IO) : Nil
+    max_window = Int32::MAX.to_u32
+    io.write_bytes((6_u32 << 8) | HTTP2::Frame::Type::SETTINGS.value, IO::ByteFormat::BigEndian)
+    io.write_byte(0_u8)
+    io.write_bytes(0_u32, IO::ByteFormat::BigEndian)
+    io.write_bytes(HTTP2::Settings::Identifier::INITIAL_WINDOW_SIZE.value.to_u16, IO::ByteFormat::BigEndian)
+    io.write_bytes(max_window, IO::ByteFormat::BigEndian)
+
+    io.write_bytes((4_u32 << 8) | HTTP2::Frame::Type::WINDOW_UPDATE.value, IO::ByteFormat::BigEndian)
+    io.write_byte(0_u8)
+    io.write_bytes(0_u32, IO::ByteFormat::BigEndian)
+    io.write_bytes(max_window - HTTP2::DEFAULT_INITIAL_WINDOW_SIZE.to_u32, IO::ByteFormat::BigEndian)
   end
 
   def close
@@ -142,6 +163,36 @@ describe GRPC::Client do
         client.tcp.not_nil!.closed?.should be_true
         client.closed?.should be_true
         client.close # closing again is harmless
+      ensure
+        server.try(&.close)
+      end
+
+      it "returns while a request body is blocked on a peer that stopped reading (#{label})" do
+        server = FakeServer.new(:stalled, tls ? server_tls : nil)
+        client = WatchedClient.new("127.0.0.1", server.port, tls ? client_tls : nil)
+        sending = Channel(Exception?).new(1)
+        spawn do
+          # far more than both kernel buffers hold, with every window open
+          client.send(HTTP::Headers{":method" => "POST", ":path" => "/stalled"}, Bytes.new(64 * 1024 * 1024)) { }
+          sending.send(nil)
+        rescue ex
+          sending.send(ex)
+        end
+        sleep 200.milliseconds # until the writer is parked in the socket write, holding the write mutex
+
+        closed = Channel(Nil).new(1)
+        spawn do
+          client.close
+          closed.send(nil)
+        end
+
+        ended_within(closed, GRPC::Client::CLOSE_TIMEOUT + 1.second).should be_true
+        select
+        when result = sending.receive
+          result.should be_a(IO::Error)
+        when timeout(1.second)
+          fail "the blocked request did not end"
+        end
       ensure
         server.try(&.close)
       end

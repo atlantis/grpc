@@ -251,7 +251,7 @@ describe GRPC::Client::OpenStream do
 
   it "closes the client and fails a waiting send when the connection drops" do
     client, server_io = piped_client
-    spawn { while read_wire_frame(server_io); end }
+    spawn { while read_wire_frame(server_io); end rescue IO::Error }
     open = client.open_stream(watch_headers)
 
     failed = Channel(Exception?).new(1)
