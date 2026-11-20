@@ -25,6 +25,8 @@ module GRPC
     # being replenished; a reply larger than the window would otherwise never finish (the server
     # waits for WINDOW_UPDATE, we wait for END_STREAM)
     @unary_bodies = {} of Stream => IO::Memory
+    # The socket this client opened, kept unwrapped under TLS: `Connection#close` leaves its IO open
+    @tcp : TCPSocket? = nil
 
     def initialize(
       host : String,
@@ -35,23 +37,33 @@ module GRPC
       @default_headers = HTTP::Headers.new,
     )
       @authority = "#{host}:#{port}"
+      @scheme = ssl_context ? "https" : "http"
 
-      io = TCPSocket.new(host, port, dns_timeout, connect_timeout)
-      io.tcp_nodelay = true
-
-      case ssl_context
-      when true
-        ssl_context = OpenSSL::SSL::Context::Client.new
-        ssl_context.alpn_protocol = "h2"
-        io = OpenSSL::SSL::Socket::Client.new(io, ssl_context, hostname: host.to_s)
-        @scheme = "https"
-      when OpenSSL::SSL::Context::Client
-        ssl_context.alpn_protocol = "h2"
-        io = OpenSSL::SSL::Socket::Client.new(io, ssl_context, hostname: host.to_s)
-        @scheme = "https"
-      else
-        @scheme = "http"
+      tcp = @tcp = TCPSocket.new(host, port, dns_timeout, connect_timeout)
+      @connection = begin
+        connect(tcp, host, ssl_context)
+      rescue ex
+        # a failed handshake or preface would otherwise leave the socket to the GC
+        tcp.close
+        raise ex
       end
+      spawn handle_connection
+    end
+
+    private def connect(tcp : TCPSocket, host : String, ssl_context : HTTP::Client::TLSContext) : Connection
+      tcp.tcp_nodelay = true
+
+      io = case ssl_context
+           when true
+             ssl_context = OpenSSL::SSL::Context::Client.new
+             ssl_context.alpn_protocol = "h2"
+             OpenSSL::SSL::Socket::Client.new(tcp, ssl_context, hostname: host)
+           when OpenSSL::SSL::Context::Client
+             ssl_context.alpn_protocol = "h2"
+             OpenSSL::SSL::Socket::Client.new(tcp, ssl_context, hostname: host)
+           else
+             tcp
+           end
 
       connection = Connection.new(io, Connection::Type::CLIENT)
       connection.write_client_preface
@@ -62,8 +74,7 @@ module GRPC
         raise Error.protocol_error("Expected SETTINGS frame")
       end
 
-      @connection = connection
-      spawn handle_connection
+      connection
     end
 
     private def handle_connection
@@ -118,6 +129,7 @@ module GRPC
     ensure
       # marks the client closed and wakes writers waiting on a window that can no longer open
       @connection.close(notify: false)
+      close_socket
       # Unblock any fibers still waiting on a request channel (GOAWAY or connection drop)
       @requests.each_value(&.close)
       @requests.clear
@@ -215,6 +227,15 @@ module GRPC
       @bidirectional_streams.each_value(&.receive.close)
       @bidirectional_streams.clear
       @connection.close unless closed?
+      close_socket
+    end
+
+    # Closes the TCP socket, never the TLS one: `SSL::Socket#close` writes a close_notify that can
+    # block on a dead peer while the read loop is inside SSL_read; closing the socket under it wakes
+    # that read with an `IO::Error` instead
+    private def close_socket : Nil
+      @tcp.try(&.close)
+    rescue IO::Error
     end
 
     def closed?

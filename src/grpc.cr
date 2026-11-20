@@ -1,5 +1,6 @@
 require "protobuf"
 require "http2"
+require "http/client"
 require "socket"
 require "openssl"
 
