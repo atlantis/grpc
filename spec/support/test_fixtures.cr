@@ -49,7 +49,7 @@ class TestableClient < GRPC::Client
     @scheme = scheme
     @default_headers = default_headers
     @requests = {} of Stream => Channel(Nil)
-    @bidirectional_streams = {} of Stream => Channel(Bytes)
+    @bidirectional_streams = {} of Stream => OpenStream
     @connection = uninitialized Connection
   end
 
@@ -66,7 +66,7 @@ class PipedClient < GRPC::Client
     @scheme = "http"
     @default_headers = HTTP::Headers.new
     @requests = {} of Stream => Channel(Nil)
-    @bidirectional_streams = {} of Stream => Channel(Bytes)
+    @bidirectional_streams = {} of Stream => OpenStream
     @connection = Connection.new(io, Connection::Type::CLIENT)
   end
 
@@ -128,4 +128,48 @@ def write_rst_stream_frame(io : IO, stream_id : Int32, code = HTTP2::Error::Code
   io.write_bytes(stream_id.to_u32, IO::ByteFormat::BigEndian)
   io.write_bytes(code.value.to_u32, IO::ByteFormat::BigEndian)
   io.flush
+end
+
+# Writes a WINDOW_UPDATE frame granting *increment* bytes on *stream_id* (0 = the connection)
+def write_window_update_frame(io : IO, stream_id : Int32, increment : Int32)
+  io.write_bytes((4_u32 << 8) | HTTP2::Frame::Type::WINDOW_UPDATE.value.to_u32, IO::ByteFormat::BigEndian)
+  io.write_byte(0_u8)
+  io.write_bytes(stream_id.to_u32, IO::ByteFormat::BigEndian)
+  io.write_bytes(increment.to_u32, IO::ByteFormat::BigEndian)
+  io.flush
+end
+
+# Splits a byte stream back into gRPC messages (1-byte flag, 4-byte big-endian length, payload)
+class GrpcMessageReader
+  @buffer = IO::Memory.new
+
+  def feed(bytes : Bytes, &) : Nil
+    @buffer.seek(0, IO::Seek::End)
+    @buffer.write(bytes)
+    @buffer.rewind
+    loop do
+      start = @buffer.pos
+      break if @buffer.size - start < 5
+      @buffer.read_byte
+      length = @buffer.read_bytes(Int32, IO::ByteFormat::BigEndian)
+      if @buffer.size - @buffer.pos < length
+        @buffer.pos = start
+        break
+      end
+      message = Bytes.new(length)
+      @buffer.read_fully(message)
+      yield message
+    end
+    rest = @buffer.to_slice[@buffer.pos..].dup
+    @buffer = IO::Memory.new
+    @buffer.write(rest)
+  end
+end
+
+def grpc_frame(payload : Bytes) : Bytes
+  io = IO::Memory.new
+  io.write_byte(0_u8)
+  io.write_bytes(payload.size, IO::ByteFormat::BigEndian)
+  io.write(payload)
+  io.to_slice
 end

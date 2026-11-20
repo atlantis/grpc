@@ -36,6 +36,7 @@ end
 
 private def write_reply(server_io, reply : Bytes, trailers, window_updates)
   spawn do
+    write_headers_frame(server_io, 1, HTTP::Headers{":status" => "200", "content-type" => "application/grpc"})
     window = HTTP2::DEFAULT_INITIAL_WINDOW_SIZE
     chunk = HTTP2::DEFAULT_MAX_FRAME_SIZE
     offset = 0
@@ -58,7 +59,7 @@ describe GRPC::Client do
   describe "#handle_connection" do
     it "hands over exactly the bytes of each DATA frame" do
       client, server_io, _ = piped_client
-      channel = client.open_stream(stream_headers)
+      channel = client.open_stream(stream_headers).receive
       stream_id = client.connection.streams.find(1).id
 
       write_data_frame(server_io, stream_id, "abc".to_slice)
@@ -78,12 +79,12 @@ describe GRPC::Client do
     it "keeps serving other streams after a consumer closes its channel" do
       client, server_io, done = piped_client
       abandoned = client.open_stream(stream_headers)
-      abandoned.close
+      abandoned.receive.close
       write_data_frame(server_io, 1, "dropped".to_slice)
 
       live = client.open_stream(stream_headers)
       write_data_frame(server_io, 3, "still here".to_slice)
-      String.new(live.receive).should eq("still here")
+      String.new(live.receive.receive).should eq("still here")
 
       select
       when done.receive

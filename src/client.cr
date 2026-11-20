@@ -18,7 +18,7 @@ module GRPC
     # How long a unary `send` waits for the stream to close before giving up
     property request_timeout : Time::Span = REQUEST_TIMEOUT
     @requests = {} of Stream => Channel(Nil)
-    @bidirectional_streams = {} of Stream => Channel(Bytes)
+    @bidirectional_streams = {} of Stream => OpenStream
     # Bytes already handed to each consumer: `Stream#data.size` is the lifetime total, not what is unread
     @consumed = {} of Stream => Int64
     # Reply bytes of each unary stream, drained as they arrive so the stream's receive window keeps
@@ -78,7 +78,7 @@ module GRPC
           if bidirectional_stream = @bidirectional_streams[frame.stream]?
             if bytes = read_unread(frame.stream)
               begin
-                bidirectional_stream.send(bytes) unless bidirectional_stream.closed?
+                bidirectional_stream.receive.send(bytes) unless bidirectional_stream.receive.closed?
               rescue Channel::ClosedError
                 # the consumer gave up on this stream; keep serving the others
                 @bidirectional_streams.delete(frame.stream)
@@ -93,6 +93,15 @@ module GRPC
           break
         end
 
+        # The server's END_STREAM ends a gRPC call even while our side is still open; reset the
+        # half-closed stream so neither peer keeps it counted against its concurrency limit
+        if frame.flags.end_stream? && frame.stream.active?
+          if bidirectional_stream = @bidirectional_streams.delete(frame.stream)
+            frame.stream.send_rst_stream(Error::Code::NO_ERROR) rescue nil
+            bidirectional_stream.receive.close
+          end
+        end
+
         # Unary requests are notified when the stream is closed
         unless frame.stream.active?
           # a waiting `send` drains the stream once more and then drops its own bookkeeping
@@ -100,19 +109,19 @@ module GRPC
             @consumed.delete(frame.stream)
             @unary_bodies.delete(frame.stream)
           end
-          if channel = @bidirectional_streams.delete(frame.stream)
-            channel.close
-          end
+          @bidirectional_streams.delete(frame.stream).try(&.receive.close)
           @requests[frame.stream]?.try(&.send(nil))
         end
       end
     rescue ex : HTTP2::Error | IO::Error
       Log.debug { "connection loop ended: #{ex.message}" }
     ensure
+      # marks the client closed and wakes writers waiting on a window that can no longer open
+      @connection.close(notify: false)
       # Unblock any fibers still waiting on a request channel (GOAWAY or connection drop)
       @requests.each_value(&.close)
       @requests.clear
-      @bidirectional_streams.each_value(&.close)
+      @bidirectional_streams.each_value(&.receive.close)
       @bidirectional_streams.clear
       @consumed.clear
       @unary_bodies.clear
@@ -180,25 +189,30 @@ module GRPC
       end
     end
 
-    # Stream request that waits for an initial response but then leaves the stream open
-    # this function will yield each time there's a new data packet on the stream
-    def open_stream(headers : HTTP::Headers, data : Bytes? = nil)
+    # Opens a bidirectional stream: sends the headers and *data* (already gRPC-framed, as from
+    # `GRPC.encode_protobuf`), then leaves the stream open for `OpenStream#send` and `#receive`
+    def open_stream(headers : HTTP::Headers, data : Bytes? = nil) : OpenStream
       stream = @connection.streams.create
-      @bidirectional_streams[stream] = Channel(Bytes).new
+      open = @bidirectional_streams[stream] = OpenStream.new(self, stream)
 
       headers = sorted_headers_with_defaults(headers)
 
       stream.send_headers(headers, flags: Frame::Flags::END_HEADERS)
 
-      stream.send_data(data) unless data.nil?
+      open.send(data) if data
 
-      @bidirectional_streams[stream]
+      open
+    end
+
+    protected def forget(stream : Stream) : Nil
+      @bidirectional_streams.delete(stream)
+      @consumed.delete(stream)
     end
 
     def close
       @requests.each_value(&.close)
       @requests.clear
-      @bidirectional_streams.each_value(&.close)
+      @bidirectional_streams.each_value(&.receive.close)
       @bidirectional_streams.clear
       @connection.close unless closed?
     end

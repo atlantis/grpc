@@ -5,6 +5,7 @@ require "openssl"
 
 require "./config"
 require "./client"
+require "./open_stream"
 require "./status_codes"
 require "./errors"
 require "./service"
